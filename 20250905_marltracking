@@ -1,0 +1,860 @@
+import os
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+import logging
+from tqdm import tqdm
+import gymnasium as gym
+from gymnasium.spaces import Box, MultiDiscrete
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
+import warnings
+import torch
+import random
+from stable_baselines3 import PPO
+from stable_baselines3.common.policies import ActorCriticPolicy
+from functools import partial
+import cv2  # Added for visualization
+
+# Suppress potential warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="stable_baselines3.common.on_policy_algorithm")
+
+# Configure detailed logging
+logging.basicConfig(
+    filename='marlmot_training_detailed.log',
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+    filemode='w'
+)
+
+def compute_iou_vectorized(bboxes1, bboxes2):
+    if len(bboxes1) == 0 or len(bboxes2) == 0:
+        return np.zeros((len(bboxes1), len(bboxes2)))
+    b1 = np.array(bboxes1)[:, np.newaxis]
+    b2 = np.array(bboxes2)[np.newaxis, :]
+    x_left = np.maximum(b1[..., 0], b2[..., 0])
+    y_top = np.maximum(b1[..., 1], b2[..., 1])
+    x_right = np.minimum(b1[..., 0] + b1[..., 2], b2[..., 0] + b2[..., 2])
+    y_bottom = np.minimum(b1[..., 1] + b1[..., 3], b2[..., 1] + b2[..., 3])
+    intersection = np.maximum(x_right - x_left, 0) * np.maximum(y_bottom - y_top, 0)
+    union = b1[..., 2] * b1[..., 3] + b2[..., 2] * b2[..., 3] - intersection
+    iou = np.where(union > 0, intersection / union, 0)
+    return iou
+
+class KalmanFilter:
+    logger = logging.getLogger(__name__)
+    def __init__(self, dim_x, dim_z):
+        self.dim_x = dim_x
+        self.dim_z = dim_z
+        self.x = np.zeros(dim_x)
+        self.P = np.eye(dim_x)
+        self.F = np.eye(dim_x)
+        self.H = np.zeros((dim_z, dim_x))
+        self.Q = np.eye(dim_x)
+        self.R = np.eye(dim_z)
+
+    def predict(self):
+        self.logger.debug(f"Predicting Kalman state: {self.x}")
+        self.x = np.dot(self.F, self.x)
+        self.P = np.dot(np.dot(self.F, self.P), self.F.T) + self.Q
+        self.x = np.nan_to_num(self.x, nan=0.0, posinf=1e6, neginf=-1e6)
+        self.P = np.nan_to_num(self.P, nan=0.0, posinf=1e6, neginf=-1e6)
+        self.x = np.clip(self.x, -1e6, 1e6)
+        self.P = np.clip(self.P, 0, 1e6)
+        self.logger.debug(f"Predicted state: {self.x}")
+
+    def update(self, z):
+        self.logger.debug(f"Updating Kalman with measurement: {z}")
+        y = z - np.dot(self.H, self.x)
+        S = np.dot(np.dot(self.H, self.P), self.H.T) + self.R
+        try:
+            K = np.dot(np.dot(self.P, self.H.T), np.linalg.inv(S))
+        except np.linalg.LinAlgError:
+            self.logger.warning("Singular matrix in Kalman update, resetting filter")
+            self._init_kalman_filter()
+            return
+        self.x = self.x + np.dot(K, y)
+        I_KH = np.eye(self.dim_x) - np.dot(K, self.H)
+        self.P = np.dot(np.dot(I_KH, self.P), I_KH.T) + np.dot(np.dot(K, self.R), K.T)
+        self.x = np.nan_to_num(self.x, nan=0.0, posinf=1e6, neginf=-1e6)
+        self.P = np.nan_to_num(self.P, nan=0.0, posinf=1e6, neginf=-1e6)
+        self.x = np.clip(self.x, -1e6, 1e6)
+        self.P = np.clip(self.P, 0, 1e6)
+        self.logger.debug(f"Updated state: {self.x}")
+
+    def _init_kalman_filter(self):
+        self.P = np.eye(self.dim_x)
+        self.P[2:5, 2:5] *= 1000  # high uncertainty for vx, vy, vs
+        self.P *= 10
+        self.Q = np.eye(self.dim_x)
+        self.Q[6, 6] *= 0.01  # small process noise for sr
+        self.Q[2:5, 2:5] *= 0.01  # small process noise for velocities
+        self.R = np.eye(self.dim_z)
+        self.R[2:, 2:] *= 10  # higher measurement noise for sa, sr
+        self.Q[5, 5] *= 0.1  # Increase process noise for s (area) to allow more change
+        self.Q[6, 6] *= 0.1  # Increase for r (ratio)
+        self.R[2, 2] *= 5  # Lower measurement noise for sa to trust det sizes more
+        self.R[3, 3] *= 5  # For sr
+class Agent:
+    logger = logging.getLogger(__name__)
+    def __init__(self, env):
+        self.env = env  # Reference to env for next_track_id
+        self.bbox = None
+        self.mode = 'inactive'
+        self.track_id = None
+        self.n_unassoc = 0
+        self.n_streak = 0
+        self.confidence = 0.0
+        self.kf = KalmanFilter(dim_x=7, dim_z=4)
+        self._init_kalman_filter()
+
+    def _init_kalman_filter(self):
+        self.kf.F = np.array([
+            [1, 0, 1, 0, 0, 0, 0],
+            [0, 1, 0, 1, 0, 0, 0],
+            [0, 0, 1, 0, 0, 0, 0],
+            [0, 0, 0, 1, 0, 0, 0],
+            [0, 0, 0, 0, 1, 0, 0],
+            [0, 0, 0, 0, 1, 1, 0],
+            [0, 0, 0, 0, 0, 0, 1]
+        ])
+        self.kf.H = np.array([
+            [1, 0, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 0, 0, 1]
+        ])
+        self.kf._init_kalman_filter()
+
+    def _state_to_bbox(self, state, frame_width, frame_height):
+        state = np.nan_to_num(state, nan=0.0, posinf=1e6, neginf=-1e6)
+        x, y, _, _, _, s, r = state
+        if s <= 0 or r <= 0 or np.any(np.isnan([s, r])):
+            return None
+        w = min(max(np.sqrt(s * r), 1.0), frame_width)  # Reduced min to 1
+        h = min(max(s / w if w > 0 else 1.0, 1.0), frame_height)  # Reduced min to 1
+        x_top_left = max(0, min(x - w / 2, frame_width - w))
+        y_top_left = max(0, min(y - h / 2, frame_height - h))
+        return [round(x_top_left, 1), round(y_top_left, 1), w, h]
+
+    def update(self, action, detection=None, confidence=0.0, frame_width=1920, frame_height=1080):
+        self.logger.debug(f"Updating agent with action: {action}, detection: {detection}, confidence: {confidence}")
+        prev_mode = self.mode
+        self.confidence = confidence
+        action_str = ['a1', 'a2', 'a3', 'a4', 'a5'][action]
+        if action_str in ['a3', 'a4', 'a5']:
+            self.kf.predict()
+            self.kf.x = np.nan_to_num(self.kf.x, nan=0.0, posinf=1e6, neginf=-1e6)
+            self.kf.P = np.nan_to_num(self.kf.P, nan=0.0, posinf=1e6, neginf=-1e6)
+        if action_str == 'a1':
+            self.mode = 'inactive'
+            self.bbox = None
+            self.track_id = None
+            self.kf.x = np.zeros(7)
+            self.kf._init_kalman_filter()
+            return True
+        elif action_str == 'a2' and detection is not None:
+            if not isinstance(detection, (list, np.ndarray)) or len(detection) != 4:
+                return False
+            detection = np.nan_to_num(detection, nan=0.0, posinf=1e6, neginf=-1e6)
+            if np.any(detection < 0):
+                return False
+            self.bbox = detection.copy()
+            self.mode = 'visible'
+            self.track_id = self.env.next_track_id if self.track_id is None else self.track_id
+            self.env.next_track_id += 1
+            x, y, w, h = detection
+            w = min(max(w, 1.0), frame_width)  # Reduced min to 1
+            h = min(max(h, 1.0), frame_height)  # Reduced min to 1
+            self.bbox = [x, y, w, h]
+            self.kf.x = np.array([x + w/2, y + h/2, 0, 0, 0, w * h, w/h if h != 0 else 1.0])
+            self.kf._init_kalman_filter()
+            return True
+        elif action_str == 'a3' and self.mode in ['visible', 'hidden']:
+            if detection is None:
+                detection = [0, 0, 0, 0]
+            if not isinstance(detection, (list, np.ndarray)) or len(detection) != 4:
+                return False
+            detection = np.nan_to_num(detection, nan=0.0, posinf=1e6, neginf=-1e6)
+            if np.any(detection < 0):
+                return False
+            self.bbox = detection.copy()
+            self.mode = 'visible'
+            x, y, w, h = detection
+            w = min(max(w, 1.0), frame_width )  # Reduced min to 1
+            h = min(max(h, 1.0), frame_height)  # Reduced min to 1
+            self.bbox = [x, y, w, h]
+            z = np.array([x + w/2, y + h/2, w * h, w/h if h != 0 else 1.0])
+            self.kf.update(z)
+            return True
+        elif action_str in ['a4', 'a5'] and self.mode in ['visible', 'hidden']:
+            self.mode = 'visible' if action_str == 'a4' else 'hidden'
+            s, r = self.kf.x[5], self.kf.x[6]
+            if abs(s) > 0.5 * frame_width * frame_height or abs(r) > 10 or np.isnan(s) or np.isnan(r):
+                self._init_kalman_filter()
+                self.bbox = None
+                self.mode = 'inactive'
+                return False
+            self.bbox = self._state_to_bbox(self.kf.x, frame_width, frame_height)
+            if self.bbox is None:
+                self.mode = 'inactive'
+                return False
+            return True
+        else:
+            return False
+
+    def reset(self):
+        self.bbox = None
+        self.mode = 'inactive'
+        self.track_id = None
+        self.n_unassoc = 0
+        self.n_streak = 0
+        self.confidence = 0.0
+        self.kf.x = np.zeros(7)
+        self.kf._init_kalman_filter()
+
+    def get_observation(self, detection=None, confidence=0.0, cost=1.0, prior_x=None, frame_width=1920, frame_height=1080):
+        obs = np.zeros(18)
+        state = prior_x if prior_x is not None else self.kf.x
+        state = np.nan_to_num(state, nan=0.0, posinf=1e6, neginf=-1e6)
+        obs[0] = state[0] / frame_width
+        obs[1] = state[1] / frame_height
+        obs[2] = state[2] / frame_width
+        obs[3] = state[3] / frame_height
+        obs[4] = state[4] / (frame_width * frame_height)
+        obs[5] = state[5] / (frame_width * frame_height)
+        obs[6] = state[6]
+        if detection is not None and not np.any(np.isnan(detection)):
+            x, y, w, h = detection
+            obs[7] = (x + w/2) / frame_width
+            obs[8] = (y + h/2) / frame_height
+            obs[9] = (w * h) / (frame_width * frame_height)
+            obs[10] = w / h if h != 0 else 1.0
+        obs[11] = np.clip(confidence, 0, 1)
+        obs[12] = (np.clip(cost, -1, 1) + 1) / 2
+        mode_idx = ['inactive', 'visible', 'hidden'].index(self.mode)
+        obs[13 + mode_idx] = 1.0
+        obs[16] = 1 / (1 + np.exp(-self.n_unassoc / 10))
+        obs[17] = 1 / (1 + np.exp(-self.n_streak / 10))
+        obs = np.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=0.0)
+        obs = np.clip(obs, 0.0, 1.0)
+        self.logger.debug(f"Generated observation: {obs}")
+        return obs
+
+class MARLMOTEnv(gym.Env):
+    logger = logging.getLogger(__name__)
+    metadata = {'render_modes': []}
+    def __init__(self, data_dir, ground_truth_dir, sequence="MOT17-05-SDP", max_agents=30):
+        super().__init__()
+        self.data_dir = data_dir
+        self.ground_truth_dir = ground_truth_dir
+        self.sequence = sequence
+        self.max_agents = max_agents
+        self.frame_width = 1920
+        self.frame_height = 1080
+        self.detections = self.load_detections(data_dir, sequence)
+        self.ground_truth = self.load_ground_truth(ground_truth_dir, sequence)
+        self.total_frames = len(self.detections)
+        self.T = self.total_frames
+        self.total_g = sum(len(gt) for gt in self.ground_truth if gt)
+        self.logger.debug(f"Loaded {self.total_frames} frames for sequence {sequence}")
+        if self.total_frames == 0:
+            self.logger.warning(f"Sequence {sequence} has no frames; setting to 1 dummy frame.")
+            self.detections = [[]]
+            self.ground_truth = [[]]
+            self.total_frames = 1
+            self.T = 1
+            self.total_g = 0
+        self._load_frame_size()
+        self.agents = [Agent(self) for _ in range(self.max_agents)]  # Pass self (env) to agents
+        self.frame_idx = 0
+        self.next_track_id = 1  # Sequential track ID counter
+        self.episode_mota_components = {'m_t': 0, 'fp_t': 0, 'mme_t': 0, 'g_t': 0, 'matches': 0}
+        self.prev_matches = {}
+        self.current_d = None
+        self.current_conf = None
+        self.current_cost = None
+        self.observation_space = Box(low=0.0, high=1.0, shape=(self.max_agents * 18 + self.max_agents * 5,), dtype=np.float32)
+        self.action_space = MultiDiscrete([5] * self.max_agents)
+        self.logger.info(f"Initialized MARLMOTEnv with {self.total_frames} frames, {self.max_agents} agents for sequence {sequence}")
+
+    def _load_frame_size(self):
+        seqinfo_path = os.path.join(self.data_dir, self.sequence, 'seqinfo.ini')
+        if os.path.exists(seqinfo_path):
+            with open(seqinfo_path, 'r') as f:
+                lines = f.readlines()
+            for line in lines:
+                if 'imWidth' in line:
+                    self.frame_width = int(line.split('=')[1].strip())
+                if 'imHeight' in line:
+                    self.frame_height = int(line.split('=')[1].strip())
+            self.logger.info(f"Loaded frame size: width={self.frame_width}, height={self.frame_height}")
+        else:
+            self.logger.warning(f"seqinfo.ini not found for {self.sequence}, using default 1920x1080")
+
+    def load_detections(self, data_dir, sequence):
+        det_path = os.path.join(data_dir, sequence, 'det', 'det.txt')
+        if not os.path.exists(det_path):
+            self.logger.warning(f"Detection file not found for {sequence}; using empty dataset.")
+            return [[]]
+        
+        with open(det_path, 'r') as f:
+            lines = [line.strip().split(',') for line in f if line.strip()]
+        if not lines:
+            self.logger.warning(f"Detection file {det_path} is empty; returning empty dataset.")
+            return [[]]
+        frame_ids = [int(line[0]) for line in lines]
+        max_frame = max(frame_ids) if frame_ids else 1
+        detections = [[] for _ in range(max_frame)]
+        invalid_detections = 0
+        for line in lines:
+            frame_id = int(line[0]) - 1
+            bbox = [float(x) for x in line[2:6]]
+            if any(x < 0 for x in bbox):
+                self.logger.warning(f"Negative coordinates in detection: {bbox}")
+                bbox = [max(0, x) for x in bbox]
+                invalid_detections += 1
+            if bbox[2] <= 0 or bbox[3] <= 0:  # Skip invalid (zero or negative size)
+                continue
+            min_area = 500  # New: skip tiny valid dets (tunable)
+            if bbox[2] * bbox[3] < min_area:
+                continue
+            if 0 <= frame_id < len(detections):
+                confidence = float(line[6]) if len(line) > 6 else 1.0
+                if confidence < 0.5:  # Optional: skip low-conf
+                    continue
+                detections[frame_id].append({'bbox': bbox, 'confidence': confidence})
+            else:
+                self.logger.warning(f"Invalid frame_id {frame_id} in detections for {sequence}")
+        self.logger.info(f"Loaded {len(detections)} frames of detections for {sequence}, {invalid_detections} had negative coordinates")
+        return detections
+
+    def load_ground_truth(self, ground_truth_dir, sequence):
+        gt_path = os.path.join(ground_truth_dir, sequence, 'gt', 'gt.txt')
+        if not os.path.exists(gt_path):
+            self.logger.warning(f"Ground truth file not found for {sequence}; using empty dataset.")
+            return [[]]
+        
+        with open(gt_path, 'r') as f:
+            lines = [line.strip().split(',') for line in f if line.strip()]
+        if not lines:
+            self.logger.warning(f"Ground truth file {gt_path} is empty; returning empty dataset.")
+            return [[]]
+        frame_ids = [int(line[0]) for line in lines]
+        max_frame = max(frame_ids) if frame_ids else 1
+        ground_truth = [[] for _ in range(max_frame)]
+        for line in lines:
+            frame_id = int(line[0]) - 1
+            if 0 <= frame_id < len(ground_truth):
+                obj_id = int(line[1])
+                bbox = [float(x) for x in line[2:6]]
+                visibility = float(line[8]) if len(line) > 8 else 1.0
+                class_id = int(line[7]) if len(line) > 7 else 1
+                if visibility > 0.0 and class_id == 1:  # Only pedestrians (class 1)
+                    ground_truth[frame_id].append({'bbox': bbox, 'id': obj_id})
+            else:
+                self.logger.warning(f"Invalid frame_id {frame_id} in ground truth for {sequence}")
+        self.logger.info(f"Loaded {len(ground_truth)} frames of ground truth for {sequence}")
+        return ground_truth
+
+    def reset(self, *, seed=None, options=None):
+        self.logger.debug(f"Reset called for sequence {self.sequence}")
+        for a in self.agents:
+            a.reset()
+        self.frame_idx = 0
+        self.next_track_id = 1  # Reset sequential ID
+        self.episode_mota_components = {'m_t': 0, 'fp_t': 0, 'mme_t': 0, 'g_t': 0, 'matches': 0}
+        self.prev_matches = {}
+        obs_list, masks, self.current_d, self.current_conf, self.current_cost = self._get_obs_and_assigns()
+        flat_obs = np.concatenate([obs_list.flatten(), masks.flatten()])
+        info = {'frame_idx': self.frame_idx}
+        self.logger.info(f"Returning obs shape {flat_obs.shape}, info {info}")
+        return flat_obs, info
+
+    def _get_obs_and_assigns(self):
+        self.logger.debug(f"Getting observations for frame_idx={self.frame_idx}, max_agents={self.max_agents}")
+        if self.frame_idx >= len(self.detections):
+            self.logger.debug(f"Frame index {self.frame_idx} exceeds detections length {len(self.detections)}")
+            return np.zeros((self.max_agents, 18)), np.zeros((self.max_agents, 5), dtype=bool), [None]*self.max_agents, [0.0]*self.max_agents, [1.0]*self.max_agents
+        detections = self.detections[self.frame_idx]
+        prior_x_list = []
+        prior_bbox_list = []
+        for a in self.agents:
+            if a.mode == 'inactive':
+                prior_x = np.zeros(7)
+                prior_bbox = [0, 0, 0, 0]
+            else:
+                prior_x = np.dot(a.kf.F, a.kf.x)
+                prior_bbox = a._state_to_bbox(prior_x, self.frame_width, self.frame_height)
+                if prior_bbox is None:
+                    prior_bbox = [0, 0, 0, 0]
+            prior_x_list.append(prior_x)
+            prior_bbox_list.append(prior_bbox)
+        det_bboxes = [d['bbox'] for d in detections]
+        det_confs = [d['confidence'] for d in detections]
+        agent_d = [None] * self.max_agents
+        agent_conf = [0.0] * self.max_agents
+        agent_cost = [0.0] * self.max_agents
+        if det_bboxes:
+            iou_matrix = compute_iou_vectorized(det_bboxes, prior_bbox_list)
+            cost_matrix = -iou_matrix
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+            for k in range(len(row_ind)):
+                r = row_ind[k]
+                c = col_ind[k]
+                if c < self.max_agents:
+                    agent_d[c] = det_bboxes[r]
+                    agent_conf[c] = det_confs[r]
+                    agent_cost[c] = cost_matrix[r, c]
+                    self.logger.debug(f"Assigned det {r} to agent {c} with IoU {-cost_matrix[r, c]:.2f}")
+                else:
+                    self.logger.debug(f"Skipped assignment for det {r} to agent {c} (low IoU {-cost_matrix[r, c]:.2f})")
+        for i, a in enumerate(self.agents):
+            if a.mode in ['visible', 'hidden']:
+                if agent_d[i] is not None:
+                    a.n_streak += 1
+                    a.n_unassoc = 0
+                else:
+                    a.n_unassoc += 1
+                    a.n_streak = 0
+            else:
+                a.n_streak = 0
+                a.n_unassoc = 0
+        obs = [self.agents[i].get_observation(agent_d[i], agent_conf[i], agent_cost[i], prior_x=prior_x_list[i], frame_width=self.frame_width, frame_height=self.frame_height) for i in range(self.max_agents)]
+        masks = np.zeros((self.max_agents, 5), dtype=bool)
+        for i in range(self.max_agents):
+            masks[i, 0] = True  # a1 always valid
+            if agent_d[i] is not None:
+                masks[i, 1] = True  # a2
+            if self.agents[i].mode in ['visible', 'hidden']:
+                masks[i, 2:5] = True  # a3, a4, a5
+        return np.array(obs), masks, agent_d, agent_conf, agent_cost
+
+    def action_masks(self):
+        masks = np.zeros((self.max_agents, 5), dtype=bool)
+        for i in range(self.max_agents):
+            masks[i, 0] = True  # a1 always valid
+            if self.current_d is not None and self.current_d[i] is not None:
+                masks[i, 1] = True  # a2
+            if self.agents[i].mode in ['visible', 'hidden']:
+                masks[i, 2:5] = True  # a3, a4, a5
+        return masks
+
+    def compute_mota(self, predictions, ground_truth):
+        if not ground_truth:
+            fp_t = sum(1 for p in predictions if p['mode'] == 'visible' and p['bbox'] is not None)
+            return {'m_t': 0, 'fp_t': fp_t, 'mme_t': 0, 'g_t': 0, 'matches': 0}
+        gt_bboxes = [gt['bbox'] for gt in ground_truth]
+        gt_ids = [gt['id'] for gt in ground_truth]
+        pred_bboxes = [p['bbox'] for p in predictions if p['mode'] == 'visible' and p['bbox'] is not None]
+        pred_ids = [p['id'] for p in predictions if p['mode'] == 'visible' and p['bbox'] is not None]
+        matches = []
+        mme_t = 0
+        if gt_bboxes and pred_bboxes:
+            iou_matrix = compute_iou_vectorized(pred_bboxes, gt_bboxes)
+            cost_matrix = 1.0 - iou_matrix
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+            for ii, jj in zip(row_ind, col_ind):
+                if cost_matrix[ii, jj] <= 0.5:
+                    matches.append((ii, jj))
+                    gt_id = gt_ids[jj]
+                    track_id = pred_ids[ii]
+                    if gt_id in self.prev_matches and self.prev_matches[gt_id] != track_id:
+                        mme_t += 1
+                    self.prev_matches[gt_id] = track_id
+        m_t = len(gt_bboxes) - len(matches)
+        fp_t = len(pred_bboxes) - len(matches)
+        g_t = len(gt_bboxes)
+        self.logger.info(f"MOTA components: m_t={m_t}, fp_t={fp_t}, mme_t={mme_t}, g_t={g_t}, matches={len(matches)}")
+        return {'m_t': m_t, 'fp_t': fp_t, 'mme_t': mme_t, 'g_t': g_t, 'matches': len(matches)}
+
+    def step(self, action):
+        self.logger.debug(f"Step called with action shape: {action.shape}, frame_idx: {self.frame_idx}")
+        if self.frame_idx >= len(self.detections):
+            g_t = self.episode_mota_components['g_t']
+            mota = 0.0 if g_t == 0 else 1 - (self.episode_mota_components['m_t'] + self.episode_mota_components['fp_t'] + self.episode_mota_components['mme_t']) / g_t
+            self.logger.info(f"Episode done, MOTA={mota}")
+            return np.zeros(self.observation_space.shape[0]), 0.0, True, False, {'mota': mota}
+        detections = self.detections[self.frame_idx] if self.frame_idx < len(self.detections) else []
+        ground_truth = self.ground_truth[self.frame_idx] if self.frame_idx < len(self.ground_truth) else []
+        self.logger.info(f"Frame {self.frame_idx}: {len(detections)} detections, {len(ground_truth)} ground truth objects")
+        if len(detections) == 0 and len(ground_truth) == 0:
+            self.frame_idx += 1
+            obs_list, masks, self.current_d, self.current_conf, self.current_cost = self._get_obs_and_assigns()
+            flat_obs = np.concatenate([obs_list.flatten(), masks.flatten()])
+            self.logger.info(f"No detections or ground truth, returning reward=0")
+            return flat_obs, 0.0, False if self.frame_idx < len(self.detections) else True, False, {'mota': 0.0}
+        for i in range(self.max_agents):
+            d = self.current_d[i]
+            conf = self.current_conf[i]
+            self.agents[i].update(action[i], d, conf, self.frame_width, self.frame_height)
+        predictions = [{'bbox': a.bbox, 'mode': a.mode, 'id': a.track_id} for a in self.agents]
+        mota_components = self.compute_mota(predictions, ground_truth)
+        errors = 0.5 * mota_components['m_t'] + 1.0 * mota_components['fp_t'] + 2.0 * mota_components['mme_t']
+        
+        if self.total_g > 0:
+            reward = mota_components['matches'] - 0.5*(mota_components['m_t'] + mota_components['fp_t'] + mota_components['mme_t'])
+        else:
+            reward = 0.0
+        reward = np.clip(reward, -25.0, 25.0)
+        if errors > 0 or mota_components['matches'] > 0:
+            self.logger.info(f"Non-zero reward frame: reward={reward}, matches={mota_components['matches']}, errors={errors}, objects={mota_components['g_t']}")
+        self.logger.info(f"Sequence {self.sequence}, Frame {self.frame_idx + 1}: m_t={mota_components['m_t']}, fp_t={mota_components['fp_t']}, mme_t={mota_components['mme_t']}, g_t={mota_components['g_t']}, matches={mota_components['matches']}, num_visible={len([p for p in predictions if p['mode'] == 'visible'])}, reward={reward}")
+        if reward == 0:
+            self.logger.warning(f"Reward is 0: m_t={mota_components['m_t']}, fp_t={mota_components['fp_t']}, mme_t={mota_components['mme_t']}, g_t={mota_components['g_t']}")
+        for key in mota_components:
+            self.episode_mota_components[key] += mota_components[key]
+        self.frame_idx += 1
+        done = self.frame_idx >= len(self.detections)
+        obs_list, masks, self.current_d, self.current_conf, self.current_cost = self._get_obs_and_assigns()
+        flat_obs = np.concatenate([obs_list.flatten(), masks.flatten()])
+        info = {'mota': 0.0 if self.episode_mota_components['g_t'] == 0 else 1 - (self.episode_mota_components['m_t'] + self.episode_mota_components['fp_t'] + self.episode_mota_components['mme_t']) / self.episode_mota_components['g_t']}
+        info['raw_reward'] = reward
+        self.logger.info(f"Predictions after update: {predictions}")  # Log for diagnosis
+
+        return flat_obs, reward, done, False, info
+
+    def render(self, mode='human'):
+        pass
+
+    # Added method for visualization
+    def visualize_frame(self, frame_idx, predictions, detections, ground_truth, img_dir):
+        frame_path = os.path.join(img_dir, f"{frame_idx + 1:06d}.jpg")
+        if not os.path.exists(frame_path):
+            self.logger.warning(f"Frame image not found: {frame_path}")
+            return None
+        img = cv2.imread(frame_path)
+        if img is None:
+            self.logger.warning(f"Failed to load image: {frame_path}")
+            return None
+
+        # Draw detections (yellow)
+        for det in detections:
+            bbox = det['bbox']
+            if bbox is not None:
+                x, y, w, h = map(int, bbox)
+                cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 255), 1)
+                cv2.putText(img, f"Det {det['confidence']:.2f}", (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+        # Draw ground truth (green)
+        for gt in ground_truth:
+            bbox = gt['bbox']
+            if bbox is not None:
+                x, y, w, h = map(int, bbox)
+                cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                cv2.putText(img, f"GT {gt['id']}", (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+        # Draw predictions/tracks (red for visible, blue for hidden)
+        for pred in predictions:
+            if pred['bbox'] is not None:
+                x, y, w, h = map(int, pred['bbox'])
+                color = (0, 0, 255) if pred['mode'] == 'visible' else (255, 0, 0)
+                cv2.rectangle(img, (x, y), (x + w, y + h), color, 2)
+                cv2.putText(img, f"Track {pred['id']} ({pred['mode']})", (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        cv2.putText(img, f"Frame {frame_idx + 1}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)  # White text at top-left
+        return img
+
+class MaskedActorCriticPolicy(ActorCriticPolicy):
+    logger = logging.getLogger(__name__)
+    def forward(self, obs, deterministic=False):
+        self.logger.debug(f"Forward pass with obs shape: {obs.shape}, deterministic: {deterministic}")
+        features = self.extract_features(obs)
+        latent_pi, latent_vf = self.mlp_extractor(features)
+        values = self.value_net(latent_vf)
+        distribution = self._get_action_dist_from_latent(latent_pi)
+        masks = obs[:, -self.action_space.nvec.size * 5:].reshape(-1, self.action_space.nvec.size, 5)
+        for i, sub_dist in enumerate(distribution.distribution):
+            sub_mask = masks[:, i]
+            sub_dist.logits = sub_dist.logits.masked_fill(~sub_mask.bool(), float('-inf'))
+        actions = distribution.mode() if deterministic else distribution.sample()
+        log_prob = distribution.log_prob(actions)
+        self.logger.debug(f"Action logits (first agent): {distribution.distribution[0].logits[:5]}")
+        self.logger.debug(f"Selected actions: {actions[:5]}")
+        return actions, values, log_prob
+
+class CombinedPlotCallback(BaseCallback):
+    def __init__(self, verbose=1):
+        super().__init__(verbose)
+        self.py_logger = logging.getLogger(__name__)
+        self.step_rewards = []
+        self.raw_step_rewards = []
+        self.episode_rewards = []
+        self.current_episode_rewards = []
+        self.episode_losses = []
+        self.current_episode_losses = []
+        self.episode_motas = []
+        self.episode_count = 0
+        self.fig, (self.ax1, self.ax2, self.ax3, self.ax4) = plt.subplots(4, 1, figsize=(8, 16))
+        self.line_raw_reward, = self.ax1.plot([], [], 'b-', label='Raw Reward per Step')
+        self.ax1.set_title('Raw Reward per Step')
+        self.ax1.set_xlabel('Step')
+        self.ax1.set_ylabel('Raw Reward')
+        self.ax1.legend()
+        self.ax1.grid(True)
+        self.line_value_loss, = self.ax2.plot([], [], 'g-', label='Value Loss per Episode')
+        self.line_policy_loss, = self.ax2.plot([], [], 'r-', label='Policy Loss per Episode')
+        self.ax2.set_title('PPO Losses per Episode')
+        self.ax2.set_xlabel('Episode')
+        self.ax2.set_ylabel('Loss')
+        self.ax2.legend()
+        self.ax2.grid(True)
+        self.line_mota, = self.ax3.plot([], [], 'r-', label='MOTA per Episode')
+        self.ax3.set_title('MOTA per Episode')
+        self.ax3.set_xlabel('Episode')
+        self.ax3.set_ylabel('MOTA')
+        self.ax3.legend()
+        self.ax3.grid(True)
+        self.ax4.set_title('Raw Reward Distribution')
+        self.ax4.set_xlabel('Raw Reward')
+        self.ax4.set_ylabel('Frequency')
+        self.ax4.grid(True)
+        self.plot_filename = 'combined_plots.png'
+
+    def _on_step(self) -> bool:
+        if 'rewards' in self.locals and 'infos' in self.locals:
+            norm_rewards = self.locals['rewards']
+            if isinstance(norm_rewards, (list, np.ndarray)) and len(norm_rewards) > 0:
+                mean_norm_reward = np.mean(norm_rewards)
+                self.step_rewards.append(mean_norm_reward)
+                self.current_episode_rewards.append(mean_norm_reward)
+            raw_rewards = [info.get('raw_reward', 0) for info in self.locals['infos'] if 'raw_reward' in info]
+            mean_raw_reward = np.mean(raw_rewards) if raw_rewards else 0
+            self.raw_step_rewards.append(mean_raw_reward)
+            self.py_logger.debug(f"Step {len(self.raw_step_rewards)}: Raw reward={mean_raw_reward}, Normalized mean={mean_norm_reward}")
+            if 'dones' in self.locals and any(self.locals['dones']):
+                self._end_episode()
+        return True
+
+    def _on_rollout_end(self) -> None:
+        value_loss = self.logger.name_to_value.get('train/value_loss', 0)
+        policy_loss = self.logger.name_to_value.get('train/policy_loss', 0)
+        if value_loss or policy_loss:
+            self.current_episode_losses.append((value_loss, policy_loss))
+            self.py_logger.debug(f"Rollout end: Value loss={value_loss}, Policy loss={policy_loss}")
+        else:
+            self.py_logger.debug("No loss values recorded in this rollout")
+
+    def _end_episode(self):
+        if self.current_episode_rewards:
+            avg_reward = np.mean(self.current_episode_rewards)
+            self.episode_rewards.append(avg_reward)
+            self.py_logger.info(f"Episode {self.episode_count + 1}: Avg normalized reward={avg_reward}")
+        else:
+            self.episode_rewards.append(0)
+        if self.current_episode_losses:
+            avg_value_loss = np.mean([l[0] for l in self.current_episode_losses])
+            avg_policy_loss = np.mean([l[1] for l in self.current_episode_losses])
+            self.episode_losses.append((avg_value_loss, avg_policy_loss))
+            self.py_logger.info(f"Episode {self.episode_count + 1}: Avg value loss={avg_value_loss}, Avg policy loss={avg_policy_loss}")
+        else:
+            self.episode_losses.append((0, 0))
+        if 'infos' in self.locals:
+            mota_values = [info['mota'] for info in self.locals['infos'] if 'mota' in info]
+            if mota_values:
+                final_mota = np.mean(mota_values)
+                self.episode_motas.append(final_mota)
+                self.py_logger.info(f"Episode {self.episode_count + 1}: Final MOTA={final_mota}")
+            else:
+                self.episode_motas.append(0)
+        else:
+            self.episode_motas.append(0)
+        self.current_episode_rewards = []
+        self.current_episode_losses = []
+        self.episode_count += 1
+        self._save_plot()
+
+    def _save_plot(self):
+        self.line_raw_reward.set_data(range(len(self.raw_step_rewards)), self.raw_step_rewards)
+        self.ax1.relim()
+        self.ax1.autoscale_view()
+        num_episodes = self.episode_count
+        value_losses = [l[0] for l in self.episode_losses] + [0] * (num_episodes - len(self.episode_losses))
+        policy_losses = [l[1] for l in self.episode_losses] + [0] * (num_episodes - len(self.episode_losses))
+        self.line_value_loss.set_data(range(num_episodes), value_losses)
+        self.line_policy_loss.set_data(range(num_episodes), policy_losses)
+        self.ax2.relim()
+        self.ax2.autoscale_view()
+        plot_motas = self.episode_motas + [0] * (num_episodes - len(self.episode_motas))
+        self.line_mota.set_data(range(num_episodes), plot_motas)
+        self.ax3.relim()
+        self.ax3.autoscale_view()
+        self.ax4.clear()
+        self.ax4.hist(self.raw_step_rewards, bins=50, color='purple', alpha=0.7)
+        self.ax4.set_title('Raw Reward Distribution')
+        self.ax4.set_xlabel('Raw Reward')
+        self.ax4.set_ylabel('Frequency')
+        self.ax4.grid(True)
+        self.fig.tight_layout()
+        plt.savefig(self.plot_filename)
+        self.py_logger.info(f"Saved plot to {self.plot_filename} for {len(self.raw_step_rewards)} steps, {num_episodes} episodes")
+
+    def _on_training_end(self) -> None:
+        if self.current_episode_rewards or self.current_episode_losses:
+            self._end_episode()
+        self._save_plot()
+        self.py_logger.info(f"Training ended, final plot saved to {self.plot_filename}")
+        plt.close(self.fig)
+
+def create_marlmot_env(data_dir, ground_truth_dir, sequence, max_agents):
+    return MARLMOTEnv(data_dir, ground_truth_dir, sequence, max_agents)
+
+def check_detections(data_dir, sequence):
+    logger = logging.getLogger(__name__)
+    det_path = os.path.join(data_dir, sequence, 'det', 'det.txt')
+    invalid_detections = 0
+    total_detections = 0
+    with open(det_path, 'r') as f:
+        for line in f:
+            if line.strip():
+                total_detections += 1
+                bbox = [float(x) for x in line.strip().split(',')[2:6]]
+                if any(x < 0 for x in bbox):
+                    invalid_detections += 1
+    logger.info(f"Sequence {sequence}: {invalid_detections}/{total_detections} detections have negative coordinates")
+
+def train_with_sb3_ppo(mot17_dir, ground_truth_dir, sequences):
+    logger = logging.getLogger(__name__)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info(f"Using device: {device}")
+    valid_sequences = []
+    for seq in sequences:
+        det_path = os.path.join(mot17_dir, seq, 'det', 'det.txt')
+        gt_path = os.path.join(ground_truth_dir, seq, 'gt', 'gt.txt')
+        if os.path.exists(det_path) and os.path.exists(gt_path):
+            valid_sequences.append(seq)
+            logger.info(f"Found valid sequence: {seq}")
+        else:
+            logger.warning(f"Skipping {seq}: det.txt exists: {os.path.exists(det_path)}, gt.txt exists: {os.path.exists(gt_path)}")
+    if not valid_sequences:
+        logger.error("No valid sequences found; check your data directory.")
+        raise ValueError("No valid sequences found; check your data directory.")
+    train_seqs = valid_sequences[:-1] if len(valid_sequences) > 1 else valid_sequences
+    val_seq = valid_sequences[-1] if len(valid_sequences) > 1 else valid_sequences[0]
+    max_agents_fixed = 30
+    num_envs = 4
+    train_env_fns = [partial(create_marlmot_env, mot17_dir, ground_truth_dir, s, max_agents_fixed) for s in train_seqs] * (num_envs // len(train_seqs) + 1)
+    train_env_fns = train_env_fns[:num_envs]
+    env = SubprocVecEnv(train_env_fns)
+    env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=1.0, clip_reward=1.0)
+    val_env_fns = [partial(create_marlmot_env, mot17_dir, ground_truth_dir, val_seq, max_agents_fixed)] * num_envs
+    val_env = SubprocVecEnv(val_env_fns)
+    val_env = VecNormalize(val_env, training=False, norm_obs=True, norm_reward=True, clip_obs=5.0, clip_reward=5.0)
+    policy_kwargs = dict(
+        ortho_init=True,
+        activation_fn=torch.nn.ReLU,
+        net_arch=[128, 64, 32]
+    )
+    def linear_lr_schedule(progress_remaining):
+        return 1e-4 * progress_remaining
+    def clip_range_schedule(progress_remaining):
+        return 0.1 + 0.2 * progress_remaining
+    model = PPO(
+        MaskedActorCriticPolicy,
+        env,
+        verbose=1,
+        device=device,
+        learning_rate=linear_lr_schedule,
+        clip_range=clip_range_schedule,
+        batch_size=1024,
+        n_epochs=20,
+        ent_coef=0.05,
+        target_kl=0.1,
+        gamma=0.95,
+        gae_lambda=0.95,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        policy_kwargs=policy_kwargs
+    )
+    combined_callback = CombinedPlotCallback()
+    eval_callback = EvalCallback(val_env, best_model_save_path='./logs/best_model/', log_path='./logs/', eval_freq=1000 * num_envs, deterministic=True, render=False)
+    try:
+        logger.info("Starting training with 10000 timesteps")
+        model.learn(total_timesteps=100000000000, callback=[combined_callback, eval_callback], progress_bar=True)
+        model.save("ppo_marlmot_test")
+        logger.info("Training completed successfully")
+    except Exception as e:
+        logger.error(f"Training failed: {e}", exc_info=True)
+        raise
+    combined_callback._save_plot()
+    return model
+
+def main():
+    mot17_dir = r"C:\Users\User\Desktop\code_python\paper2_multi_tracking\train"
+    ground_truth_dir = mot17_dir
+    sequences = ['MOT17-05-SDP']
+    logger = logging.getLogger(__name__)
+    logger.info("Starting test run with limited timesteps")
+    
+    # Check detections for negative coordinates
+    check_detections(mot17_dir, 'MOT17-05-SDP')
+    
+    # Test environment with action masks and visualization
+    logger.info("Starting environment test with visualization")
+    sequence = 'MOT17-05-SDP'
+    img_dir = os.path.join(mot17_dir, sequence, 'img1')
+    if not os.path.exists(img_dir):
+        logger.error(f"Image directory not found: {img_dir}. Visualization skipped.")
+        return
+
+    # env = MARLMOTEnv(data_dir=mot17_dir, ground_truth_dir=ground_truth_dir, sequence=sequence, max_agents=30)
+    # obs, info = env.reset()
+    # done = False
+    # steps = 0
+    # video_path = 'test_tracking_video.mp4'
+    # fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    # video_writer = cv2.VideoWriter(video_path, fourcc, 10.0, (env.frame_width, env.frame_height))
+    # logger.info(f"Creating video at {video_path}")
+
+    # while not done and steps < env.total_frames:  # Run through all frames for full test
+    #     masks = env.action_masks()
+    #     valid_actions = []
+    #     for i in range(env.max_agents):
+    #         possible = np.where(masks[i])[0]
+    #         if env.current_d[i] is not None:
+    #             if 2 in possible:
+    #                 valid_actions.append(2)
+    #             elif 1 in possible:
+    #                 valid_actions.append(1)
+    #             else:
+    #                 valid_actions.append(np.random.choice(possible))
+    #         else:
+    #             if 3 in possible:
+    #                 valid_actions.append(3)
+    #             else:
+    #                 valid_actions.append(0)
+    #                 action = np.array(valid_actions)
+
+    #     # In MARLMOTEnv.step, after assignment/update:
+
+    #     obs, reward, done, _, info = env.step(action)
+
+
+    #     # Get current state for visualization
+    #     predictions = [{'bbox': a.bbox, 'mode': a.mode, 'id': a.track_id} for a in env.agents]
+    #     detections = env.detections[env.frame_idx - 1] if env.frame_idx - 1 < len(env.detections) else []
+    #     ground_truth = env.ground_truth[env.frame_idx - 1] if env.frame_idx - 1 < len(env.ground_truth) else []
+
+    #     # Visualize and add to video
+    #     vis_img = env.visualize_frame(env.frame_idx - 1, predictions, detections, ground_truth, img_dir)
+    #     if vis_img is not None:
+    #         video_writer.write(vis_img)
+    #         logger.debug(f"Added frame {env.frame_idx - 1} to video")
+
+    #     logger.debug(f"Environment test step {steps}: Obs shape: {obs.shape}, Reward: {reward}, Done: {done}, Info: {info}")
+    #     steps += 1
+
+    # video_writer.release()
+    # logger.info(f"Environment test completed. Video saved to {video_path}. Check 'marlmot_training_detailed.log' for detailed logs.")
+    
+    # Optionally uncomment to run training after test
+    logger.info("Starting training")
+    train_with_sb3_ppo(mot17_dir, ground_truth_dir, sequences)
+
+if __name__ == "__main__":
+    main()
