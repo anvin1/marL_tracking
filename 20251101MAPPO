@@ -1,0 +1,976 @@
+import os
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+from tqdm import tqdm
+import gymnasium as gym
+from gymnasium.spaces import Box, MultiDiscrete
+import matplotlib.pyplot as plt
+import warnings
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.distributions import Categorical
+from torch.cuda.amp import autocast, GradScaler
+import random
+from functools import partial
+import copy
+from collections import namedtuple, deque
+import cv2 # For visualization in render()
+import math
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
+# Suppress potential warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="stable_baselines3.common.on_policy_algorithm")
+def compute_iou_vectorized(bboxes1, bboxes2, device='cpu'):
+    if len(bboxes1) == 0 or len(bboxes2) == 0:
+        return np.zeros((len(bboxes1), len(bboxes2)))
+    b1 = torch.tensor(bboxes1, device=device).unsqueeze(1) # (N,1,4)
+    b2 = torch.tensor(bboxes2, device=device).unsqueeze(0) # (1,M,4)
+    x_left = torch.max(b1[..., 0], b2[..., 0])
+    y_top = torch.max(b1[..., 1], b2[..., 1])
+    x_right = torch.min(b1[..., 0] + b1[..., 2], b2[..., 0] + b2[..., 2])
+    y_bottom = torch.min(b1[..., 1] + b1[..., 3], b2[..., 1] + b2[..., 3])
+    intersection = torch.clamp(x_right - x_left, min=0) * torch.clamp(y_bottom - y_top, min=0)
+    union = b1[..., 2] * b1[..., 3] + b2[..., 2] * b2[..., 3] - intersection
+    iou = intersection / (union + 1e-6) # Avoid div0
+    return iou.cpu().numpy()
+class KalmanFilter:
+    def __init__(self, dim_x, dim_z, frame_width=1920, frame_height=1080):
+        self.dim_x = 7  # [cx, cy, s, ar, vx, vy, vs]
+        self.dim_z = 4
+        self.x = np.zeros(7)
+        self.P = np.eye(7)
+        self.F = np.eye(7)
+        self.H = np.zeros((4, 7))
+        self.Q = np.eye(7)
+        self.R = np.eye(4)
+        self.frame_width = frame_width  # New: Để clamp based on frame
+        self.frame_height = frame_height
+        self._init_kalman_filter()
+
+    def predict(self):
+        self.x = np.dot(self.F, self.x)
+        self.P = np.dot(np.dot(self.F, self.P), self.F.T) + self.Q
+        # Soften clamp: Giới hạn dựa trên frame để tránh drift aggressive
+        self.x[0] = np.clip(self.x[0], 0, self.frame_width)  # cx
+        self.x[1] = np.clip(self.x[1], 0, self.frame_height)  # cy
+        self.x[2] = np.clip(self.x[2], 1e-6, self.frame_width * self.frame_height)  # s >0, < max_area
+        self.x[3] = np.clip(self.x[3], 0.1, 10.0)  # ar reasonable
+        self.x[4:7] = np.clip(self.x[4:7], -self.frame_width/10, self.frame_width/10)  # vx/vy/vs không quá lớn
+        self.P = np.clip(self.P, 0, 1e6)  # Giữ P positive
+
+    def update(self, z):
+        y = z - np.dot(self.H, self.x)
+        S = np.dot(np.dot(self.H, self.P), self.H.T) + self.R
+        try:
+            K = np.dot(np.dot(self.P, self.H.T), np.linalg.inv(S))
+        except np.linalg.LinAlgError:
+            self.P *= 1.5  # Tăng P để trust less, tránh drift
+            return
+        self.x = self.x + np.dot(K, y)
+        I_KH = np.eye(self.dim_x) - np.dot(K, self.H)
+        self.P = np.dot(np.dot(I_KH, self.P), I_KH.T) + np.dot(np.dot(K, self.R), K.T)
+        # Soften: Chỉ nan_to_num nếu thật sự NaN, dùng giá trị trước
+        self.x = np.nan_to_num(self.x, nan=self.x, posinf=1e6, neginf=-1e6)  # Dùng giá trị trước nếu nan
+        self.P = np.nan_to_num(self.P, nan=0.0, posinf=1e6, neginf=0)
+        # Clamp như predict để consistent
+        self.x[0] = np.clip(self.x[0], 0, self.frame_width)
+        self.x[1] = np.clip(self.x[1], 0, self.frame_height)
+        self.x[2] = np.clip(self.x[2], 1e-6, self.frame_width * self.frame_height)
+        self.x[3] = np.clip(self.x[3], 0.1, 10.0)
+        self.x[4:7] = np.clip(self.x[4:7], -self.frame_width/10, self.frame_width/10)
+        self.P = np.clip(self.P, 0, 1e6)
+
+    def _init_kalman_filter(self):
+        # Transition matrix F (constant velocity model, constant aspect ratio)
+        self.F = np.array([
+            [1, 0, 0, 0, 1, 0, 0], # cx' = cx + vx
+            [0, 1, 0, 0, 0, 1, 0], # cy' = cy + vy
+            [0, 0, 1, 0, 0, 0, 1], # s' = s + vs
+            [0, 0, 0, 1, 0, 0, 0], # ar' = ar
+            [0, 0, 0, 0, 1, 0, 0], # vx' = vx
+            [0, 0, 0, 0, 0, 1, 0], # vy' = vy
+            [0, 0, 0, 0, 0, 0, 1] # vs' = vs
+        ])
+        # Measurement matrix H (measures cx, cy, s, ar)
+        self.H = np.array([
+            [1, 0, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0, 0, 0],
+            [0, 0, 0, 1, 0, 0, 0]
+        ])
+        # Initial uncertainty P (high for velocities)
+        self.P = np.eye(7) * 1000.0 # High initial uncertainty
+        self.P[4:7, 4:7] *= 10.0 # Even higher for velocities
+        # Process noise Q (small for positions, moderate for size changes, higher for velocities)
+        self.Q = np.diag([0.05, 0.05, 0.005, 0.005, 2.0, 2.0, 0.2]) # Reduced position noise, increased vel/size
+        # Tune R: Lower for cx/cy/s to trust detections more, keep moderate for ar
+        self.R = np.diag([5.0, 5.0, 2.0, 5.0]) # Decreased from [10,10,5,5]
+class Agent:
+    def __init__(self, env):
+        self.env = env
+        self.bbox = None
+        self.mode = 'inactive'
+        self.track_id = None
+        self.n_unassoc = 0
+        self.n_streak = 0
+        self.confidence = 0.0
+        self.n_invalid = 0  # New: Streak of invalid states
+        self.max_invalid_streak = 3  # New: Allow 3 frames invalid trước deactivate (adjust theo dataset)
+        self.kf = KalmanFilter(dim_x=7, dim_z=4, frame_width=env.frame_width, frame_height=env.frame_height)  # Pass frame size
+        self._init_kalman_filter()
+
+    def _init_kalman_filter(self):
+        self.kf._init_kalman_filter()
+
+    def _state_to_bbox(self, state, frame_width, frame_height):
+        state = np.nan_to_num(state, nan=0.0, posinf=1e6, neginf=-1e6)
+        cx, cy, s, ar, vx, vy, vs = state
+        # New: Clamp velocity để tránh drift lớn dẫn đến out-of-bound
+        vx = np.clip(vx, -frame_width/5, frame_width/5)  # Max vel 1/5 frame/frame (adjust nếu cần)
+        vy = np.clip(vy, -frame_height/5, frame_height/5)
+        vs = np.clip(vs, -s/2, s/2)  # Không thay đổi size quá nhanh
+        if s <= 0 or ar <= 0 or np.any(np.isnan([s, ar])):
+            return None
+        w = np.sqrt(s / ar)
+        h = np.sqrt(s * ar)
+        if w <= 0 or h <= 0:
+            return None
+        w = min(max(w, 1.0), frame_width)
+        h = min(max(h, 1.0), frame_height)
+        x_top_left = max(0, min(cx - w / 2, frame_width - w))
+        y_top_left = max(0, min(cy - h / 2, frame_height - h))
+        # New: Đảm bảo bbox không hoàn toàn out-of-bound
+        if x_top_left + w <= 0 or y_top_left + h <= 0 or x_top_left >= frame_width or y_top_left >= frame_height:
+            return None  # Vẫn invalid nếu ngoài hẳn
+        return [round(x_top_left, 1), round(y_top_left, 1), w, h]
+
+    def update(self, action, detection=None, confidence=0.0, frame_width=1920, frame_height=1080):
+        prev_mode = self.mode
+        self.confidence = confidence
+        action_str = ['a1', 'a2', 'a3', 'a4', 'a5'][action]
+        if action_str in ['a3', 'a4', 'a5']:
+            self.kf.predict()
+            self.kf.x = np.nan_to_num(self.kf.x, nan=0.0, posinf=1e6, neginf=-1e6)
+            self.kf.P = np.nan_to_num(self.kf.P, nan=0.0, posinf=1e6, neginf=-1e6)
+        if action_str == 'a1':
+            self.mode = 'inactive'
+            self.bbox = None
+            self.track_id = None
+            self.kf.x = np.zeros(7)
+            self.kf._init_kalman_filter()
+            return True
+        elif action_str == 'a2':
+            if detection is None:
+                return False
+            if not isinstance(detection, (list, np.ndarray)) or len(detection) != 4:
+                return False
+            detection = np.nan_to_num(detection, nan=0.0, posinf=1e6, neginf=-1e6)
+            if np.any(detection < 0):
+                return False
+            self.bbox = detection.copy()
+            self.mode = 'visible'
+            self.track_id = self.env.next_track_id if self.track_id is None else self.track_id
+            self.env.next_track_id += 1
+            x, y, w, h = detection
+            w = min(max(w, 1.0), frame_width)
+            h = min(max(h, 1.0), frame_height)
+            s = w * h
+            ar = h / w if w > 0 else 1.0
+            cx = x + w / 2
+            cy = y + h / 2
+            self.bbox = [x, y, w, h]
+            self.kf.x = np.array([cx, cy, s, ar, 0, 0, 0]) # Initial velocities 0
+            self.kf._init_kalman_filter()
+            return True
+        elif action_str == 'a3':
+            if detection is None:
+                return False
+            if not isinstance(detection, (list, np.ndarray)) or len(detection) != 4:
+                return False
+            detection = np.nan_to_num(detection, nan=0.0, posinf=1e6, neginf=-1e6)
+            if np.any(detection < 0):
+                return False
+            if self.mode not in ['visible', 'hidden']:
+                return False
+            self.bbox = detection.copy()
+            self.mode = 'visible'
+            x, y, w, h = detection
+            w = min(max(w, 1.0), frame_width)
+            h = min(max(h, 1.0), frame_height)
+            s = w * h
+            ar = h / w if w > 0 else 1.0
+            cx = x + w / 2
+            cy = y + h / 2
+            self.bbox = [x, y, w, h]
+            z = np.array([cx, cy, s, ar])
+            self.kf.update(z)
+            return True
+        elif action_str in ['a4', 'a5']:
+            if self.mode not in ['visible', 'hidden']:
+                return False
+            self.mode = 'visible' if action_str == 'a4' else 'hidden'
+            cx, cy, s, ar = self.kf.x[0:4]
+            # New: Check invalid với streak để tránh chết sớm
+            if s > 0.5 * frame_width * frame_height or s <= 0 or ar < 0.1 or ar > 10 or np.isnan(s) or np.isnan(ar):
+                self.n_invalid += 1
+                if self.n_invalid > self.max_invalid_streak:
+                    self._init_kalman_filter()
+                    self.bbox = None
+                    self.mode = 'inactive'
+                    self.n_invalid = 0
+                    return False
+                else:
+                    # Recovery: Giữ bbox cũ nếu streak nhỏ
+                    return True
+            else:
+                self.n_invalid = 0  # Reset streak
+            self.bbox = self._state_to_bbox(self.kf.x, frame_width, frame_height)
+            if self.bbox is None:
+                self.n_invalid += 1
+                if self.n_invalid > self.max_invalid_streak:
+                    self._init_kalman_filter()
+                    self.bbox = None
+                    self.mode = 'inactive'
+                    self.n_invalid = 0
+                    return False
+            return True
+        else:
+            return False
+
+    def reset(self):
+        self.bbox = None
+        self.mode = 'inactive'
+        self.track_id = None
+        self.n_unassoc = 0
+        self.n_streak = 0
+        self.confidence = 0.0
+        self.n_invalid = 0  # Reset streak
+        self.kf.x = np.zeros(7)
+        self.kf._init_kalman_filter()
+
+    def get_observation(self, detection=None, confidence=0.0, cost=1.0, prior_x=None, frame_width=1920, frame_height=1080):
+        obs = np.zeros(18)
+        state = prior_x if prior_x is not None else self.kf.x
+        state = np.nan_to_num(state, nan=0.0, posinf=1e6, neginf=-1e6)
+        max_area = frame_width * frame_height
+        obs[0] = state[0] / frame_width # cx
+        obs[1] = state[1] / frame_height # cy
+        obs[2] = state[4] / frame_width # vx
+        obs[3] = state[5] / frame_height # vy
+        obs[4] = state[6] / max_area # vs
+        obs[5] = state[2] / max_area # s
+        obs[6] = np.clip(state[3], 0.1, 10.0) / 10.0 # ar normalized
+        if detection is not None and not np.any(np.isnan(detection)):
+            x, y, w, h = detection
+            cx_d = (x + w/2) / frame_width
+            cy_d = (y + h/2) / frame_height
+            s_d = (w * h) / max_area
+            ar_d = (h / w if w > 0 else 1.0)
+            ar_d = np.clip(ar_d, 0.1, 10.0) / 10.0
+            obs[7] = cx_d
+            obs[8] = cy_d
+            obs[9] = s_d
+            obs[10] = ar_d
+        obs[11] = np.clip(confidence, 0, 1)
+        obs[12] = (np.clip(cost, -1, 1) + 1) / 2
+        mode_idx = ['inactive', 'visible', 'hidden'].index(self.mode)
+        obs[13 + mode_idx] = 1.0
+        obs[16] = 1 / (1 + np.exp(-self.n_streak))
+        obs[17] = 1 / (1 + np.exp(-self.n_unassoc))
+        obs = np.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=0.0)
+        obs = np.clip(obs, 0.0, 1.0)
+        return obs
+class MARLMOTEnv(gym.Env):
+    metadata = {'render_modes': []}
+    def __init__(self, data_dir, ground_truth_dir, sequence="MOT17-05-SDP", max_agents=30):
+        super().__init__()
+        self.data_dir = data_dir
+        self.ground_truth_dir = ground_truth_dir
+        self.sequence = sequence
+        self.max_agents = max_agents
+        self.frame_width = 1920
+        self.frame_height = 1080
+        # FIX: Change thresholds for MOT15 (positive confidences, higher better)
+        # Use standard ByteTrack values: high=0.6, low=0.1 for conf in [0,1]
+        # match_thresh=0.5 for reasonable IoU matching (0.1 was too permissive)
+        self.high_thresh = 0.5
+        self.low_thresh = 0.1
+        self.match_thresh = 0.1
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.detections = self.load_detections(data_dir, sequence)
+        self.ground_truth = self.load_ground_truth(ground_truth_dir, sequence)
+        self.total_frames = len(self.detections)
+        self.T = self.total_frames
+        self.total_g = sum(len(gt) for gt in self.ground_truth if gt)
+        if self.total_frames == 0:
+            self.detections = [[]]
+            self.ground_truth = [[]]
+            self.total_frames = 1
+            self.T = 1
+            self.total_g = 0
+        self._load_frame_size()
+        self.agents = [Agent(self) for _ in range(self.max_agents)]
+        self.frame_idx = 0
+        self.next_track_id = 1
+        self.episode_mota_components = {'m_t': 0, 'fp_t': 0, 'mme_t': 0, 'g_t': 0, 'matches': 0}
+        self.prev_matches = {}
+        self.current_d = None
+        self.current_conf = None
+        self.current_cost = None
+        self.observation_space = Box(low=0.0, high=1.0, shape=(self.max_agents * 18,), dtype=np.float32) # Changed to 18
+        self.action_space = MultiDiscrete([5] * self.max_agents)
+        self.img_dir = os.path.join(self.data_dir, self.sequence, 'img1')
+        self.video_writer = None # For optional video saving in render
+        self.episode_count = 0 # Track episode number for video naming
+    def load_detections(self, data_dir, sequence):
+        det_path = os.path.join(data_dir, sequence, 'det', 'det.txt')
+        self.img_dir = os.path.join(data_dir, sequence, 'img1')
+        if not os.path.exists(det_path):
+            return [[]]
+        with open(det_path, 'r') as f:
+            lines = [line.strip().split(',') for line in f if line.strip()]
+        if not lines:
+            return [[]]
+        frame_ids = [int(line[0]) for line in lines]
+        max_frame = max(frame_ids) if frame_ids else 1
+        detections = [[] for _ in range(max_frame)]
+        for line in lines:
+            if len(line) < 10: # Skip invalid lines
+                continue
+            frame_id = int(line[0]) - 1
+            if 0 <= frame_id < len(detections):
+                bbox = [float(line[2]), float(line[3]), float(line[4]), float(line[5])]
+                conf = float(line[6])
+                # Normalize conf if it's not in 0-1 (e.g., for MOT15 scales)
+                if conf > 1.0: # Assume it's 0-100; adjust if needed based on your data
+                    conf /= 100.0
+                conf = np.clip(conf, 0.0, 1.0)  # Thêm clamp để tránh giá trị âm hoặc ngoài range
+                # Clamp bbox to frame bounds
+                x, y, w, h = bbox
+                x = max(0, x)
+                y = max(0, y)
+                w = min(self.frame_width - x, w) if self.frame_width - x > 0 else w
+                h = min(self.frame_height - y, h) if self.frame_height - y > 0 else h
+                bbox = [x, y, w, h]
+                # if conf > self.low_thresh:
+                detections[frame_id].append({'bbox': bbox, 'confidence': conf})
+        return detections
+    def load_ground_truth(self, ground_truth_dir, sequence):
+        gt_path = os.path.join(ground_truth_dir, sequence, 'gt', 'gt.txt')
+        if not os.path.exists(gt_path):
+            return [[]]
+        with open(gt_path, 'r') as f:
+            lines = [line.strip().split(',') for line in f if line.strip()]
+        if not lines:
+            return [[]]
+        frame_ids = [int(line[0]) for line in lines]
+        max_frame = max(frame_ids) if frame_ids else 1
+        ground_truth = [[] for _ in range(max_frame)]
+        for line in lines:
+            if len(line) < 9: # Bỏ qua dòng không đủ cột
+                continue
+            frame_id = int(line[0]) - 1
+            if 0 <= frame_id < len(ground_truth):
+                obj_id = int(line[1])
+                bbox = [float(x) for x in line[2:6]]
+                
+                # Filter cho MOT15/MOT17: conf=1, class=1 hoặc -1 (pedestrian), visibility >0 hoặc -1
+                # if conf == 1 and class_id ==-1 and visibility == -1:
+                ground_truth[frame_id].append({'bbox': bbox, 'id': obj_id})
+            else:
+                pass
+        return ground_truth
+    def _load_frame_size(self):
+        seqinfo_path = os.path.join(self.data_dir, self.sequence, 'seqinfo.ini')
+        if os.path.exists(seqinfo_path):
+            with open(seqinfo_path, 'r') as f:
+                lines = f.readlines()
+            for line in lines:
+                if 'imWidth' in line:
+                    self.frame_width = int(line.split('=')[1].strip())
+                if 'imHeight' in line:
+                    self.frame_height = int(line.split('=')[1].strip())
+        else:
+            pass
+    def reset(self, *, seed=None, options=None):
+        for a in self.agents:
+            a.reset()
+        self.frame_idx = 0
+        self.next_track_id = 1
+        self.episode_mota_components = {'m_t': 0, 'fp_t': 0, 'mme_t': 0, 'g_t': 0, 'matches': 0}
+        self.prev_matches = {}
+        obs_list, self.current_d, self.current_conf, self.current_cost = self._get_obs_and_assigns()
+        flat_obs = obs_list.flatten()
+        info = {'frame_idx': self.frame_idx}
+        # Handle video writer per 10 episodes
+        if self.video_writer is not None:
+            self.video_writer.release()
+            self.video_writer = None
+        self.episode_count += 1
+        if self.episode_count % 10 == 0:
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            video_path = f'tracking_episode_{self.episode_count}.mp4'
+            self.video_writer = cv2.VideoWriter(video_path, fourcc, 30.0, (self.frame_width, self.frame_height))
+        return flat_obs, info
+    def _get_obs_and_assigns(self):
+        if self.frame_idx >= len(self.detections):
+            return np.zeros((self.max_agents, 18)), [None]*self.max_agents, [0.0]*self.max_agents, [1.0]*self.max_agents
+        detections = self.detections[self.frame_idx]
+        prior_x_list = []
+        prior_bbox_list = []
+        for a in self.agents:
+            if a.mode == 'inactive':
+                prior_x = np.zeros(7)
+                prior_bbox = [0, 0, 0, 0]
+            else:
+                prior_x = np.dot(a.kf.F, a.kf.x)
+                prior_bbox = a._state_to_bbox(prior_x, self.frame_width, self.frame_height)
+                if prior_bbox is None:
+                    prior_bbox = [0, 0, 0, 0]
+            prior_x_list.append(prior_x)
+            prior_bbox_list.append(prior_bbox)
+        det_bboxes = [d['bbox'] for d in detections]
+        det_confs = [d['confidence'] for d in detections]
+        agent_d = [None] * self.max_agents
+        agent_conf = [0.0] * self.max_agents
+        agent_cost = [1.0] * self.max_agents
+        # ByteTrack-like association
+        existing_indices = [i for i, a in enumerate(self.agents) if a.mode != 'inactive']
+        existing_priors = [prior_bbox_list[i] for i in existing_indices]
+        high_dets_indices = [i for i, c in enumerate(det_confs) if c > self.high_thresh]
+        high_dets = [det_bboxes[i] for i in high_dets_indices]
+        high_confs = [det_confs[i] for i in high_dets_indices]
+        assigned = {}
+        matched_high_dets = set()
+        if high_dets and existing_priors:
+            iou_matrix = compute_iou_vectorized(high_dets, existing_priors, device=self.device)
+            cost_matrix = -iou_matrix
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+            for r, c in zip(row_ind, col_ind):
+                if iou_matrix[r, c] > self.match_thresh:
+                    agent_idx = existing_indices[c]
+                    assigned[agent_idx] = (high_dets[r], high_confs[r], cost_matrix[r, c])
+                    matched_high_dets.add(high_dets_indices[r])
+        unmatched_existing = [i for i in existing_indices if i not in assigned]
+        unmatched_priors = [prior_bbox_list[i] for i in unmatched_existing]
+        low_dets_indices = [i for i, c in enumerate(det_confs) if self.low_thresh < c <= self.high_thresh]
+        low_dets = [det_bboxes[i] for i in low_dets_indices]
+        low_confs = [det_confs[i] for i in low_dets_indices]
+        if low_dets and unmatched_priors:
+            iou_matrix = compute_iou_vectorized(low_dets, unmatched_priors, device=self.device)
+            cost_matrix = -iou_matrix
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+            for r, c in zip(row_ind, col_ind):
+                if iou_matrix[r, c] > self.match_thresh:
+                    agent_idx = unmatched_existing[c]
+                    assigned[agent_idx] = (low_dets[r], low_confs[r], cost_matrix[r, c])
+        # Assign unmatched high dets to inactive agents for potential new tracks
+        unmatched_high_indices = [i for i in high_dets_indices if i not in matched_high_dets]
+        unmatched_high_dets = [det_bboxes[i] for i in unmatched_high_indices]
+        unmatched_high_confs = [det_confs[i] for i in unmatched_high_indices]
+        inactive_indices = [i for i, a in enumerate(self.agents) if a.mode == 'inactive']
+        num_new = min(len(inactive_indices), len(unmatched_high_dets))
+        for j in range(num_new):
+            agent_idx = inactive_indices[j]
+            d = unmatched_high_dets[j]
+            conf = unmatched_high_confs[j]
+            cost = 0.0 # Arbitrary for new tracks
+            agent_d[agent_idx] = d
+            agent_conf[agent_idx] = conf
+            agent_cost[agent_idx] = cost
+        # Set assigned for existing
+        for agent_idx, (d, conf, cost) in assigned.items():
+            agent_d[agent_idx] = d
+            agent_conf[agent_idx] = conf
+            agent_cost[agent_idx] = cost
+        # Update streaks
+        for i, a in enumerate(self.agents):
+            if a.mode in ['visible', 'hidden']:
+                if agent_d[i] is not None:
+                    a.n_streak += 1
+                    a.n_unassoc = 0
+                else:
+                    a.n_unassoc += 1
+                    a.n_streak = 0
+            else:
+                a.n_streak = 0
+                a.n_unassoc = 0
+        obs = [self.agents[i].get_observation(agent_d[i], agent_conf[i], agent_cost[i], prior_x=prior_x_list[i], frame_width=self.frame_width, frame_height=self.frame_height) for i in range(self.max_agents)]
+        return np.array(obs), agent_d, agent_conf, agent_cost
+    def compute_mota(self, predictions, ground_truth, update_matches=True):
+        if not ground_truth:
+            fp_t = sum(1 for p in predictions if p['mode'] == 'visible' and p['bbox'] is not None)
+            return {'m_t': 0, 'fp_t': fp_t, 'mme_t': 0, 'g_t': 0, 'matches': 0}
+        gt_bboxes = [gt['bbox'] for gt in ground_truth]
+        gt_ids = [gt['id'] for gt in ground_truth]
+        pred_bboxes = [p['bbox'] for p in predictions if p['mode'] == 'visible' and p['bbox'] is not None]
+        pred_ids = [p['id'] for p in predictions if p['mode'] == 'visible' and p['bbox'] is not None]
+        matches = []
+        mme_t = 0
+        if gt_bboxes and pred_bboxes:
+            iou_matrix = compute_iou_vectorized(pred_bboxes, gt_bboxes, device=self.device)
+            cost_matrix = 1.0 - iou_matrix
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+            for ii, jj in zip(row_ind, col_ind):
+                if cost_matrix[ii, jj] <= 0.5:
+                    matches.append((ii, jj))
+                    gt_id = gt_ids[jj]
+                    track_id = pred_ids[ii]
+                    if gt_id in self.prev_matches and self.prev_matches[gt_id] != track_id:
+                        mme_t += 1
+                    if update_matches:
+                        self.prev_matches[gt_id] = track_id
+        m_t = len(gt_bboxes) - len(matches)
+        fp_t = len(pred_bboxes) - len(matches)
+        g_t = len(gt_bboxes)
+        return {'m_t': m_t, 'fp_t': fp_t, 'mme_t': mme_t, 'g_t': g_t, 'matches': len(matches)}
+    def step(self, action):
+        if self.frame_idx >= len(self.detections):
+            g_t = self.episode_mota_components['g_t']
+            mota = 0.0 if g_t == 0 else 1 - (self.episode_mota_components['m_t'] + self.episode_mota_components['fp_t'] + self.episode_mota_components['mme_t']) / g_t
+            return np.zeros(self.observation_space.shape[0]), 0.0, True, False, {'mota': mota}
+        detections = self.detections[self.frame_idx] if self.frame_idx < len(self.detections) else []
+        ground_truth = self.ground_truth[self.frame_idx] if self.frame_idx < len(self.ground_truth) else []
+        if len(detections) == 0 and len(ground_truth) == 0:
+            self.frame_idx += 1
+            obs_list, self.current_d, self.current_conf, self.current_cost = self._get_obs_and_assigns()
+            flat_obs = obs_list.flatten()
+            return flat_obs, 0.0, False if self.frame_idx < len(self.detections) else True, False, {'mota': 0.0}
+        for i in range(self.max_agents):
+            d = self.current_d[i]
+            conf = self.current_conf[i]
+            self.agents[i].update(action[i], d, conf, self.frame_width, self.frame_height)
+        predictions = [{'bbox': a.bbox, 'mode': a.mode, 'id': a.track_id} for a in self.agents]
+        mota_components = self.compute_mota(predictions, ground_truth)
+        reward = - (mota_components['m_t'] + mota_components['fp_t'] + mota_components['mme_t']) + mota_components['matches']
+        if mota_components['m_t'] > 0 or mota_components['fp_t'] > 0 or mota_components['mme_t'] > 0 or mota_components['matches'] > 0:
+            pass
+        if reward == 0:
+            pass
+        for key in mota_components:
+            self.episode_mota_components[key] += mota_components[key]
+        self.frame_idx += 1
+        done = self.frame_idx >= len(self.detections)
+        obs_list, self.current_d, self.current_conf, self.current_cost = self._get_obs_and_assigns()
+        flat_obs = obs_list.flatten()
+        info = {'mota': 0.0 if self.episode_mota_components['g_t'] == 0 else 1 - (self.episode_mota_components['m_t'] + self.episode_mota_components['fp_t'] + self.episode_mota_components['mme_t']) / self.episode_mota_components['g_t']}
+        return flat_obs, reward, done, False, info
+    def render(self, mode='human'):
+        if self.frame_idx == 0:
+            return # Skip if before first frame
+        # Load the current frame image (frames are 1-indexed, padded to 6 digits)
+        frame_path = os.path.join(self.img_dir, f"{self.frame_idx:06d}.jpg")
+        if not os.path.exists(frame_path):
+            return
+        img = cv2.imread(frame_path)
+        if img is None:
+            return
+        # Get visible predictions (tracked bboxes with IDs)
+        predictions = [{'bbox': a.bbox, 'id': a.track_id} for a in self.agents if a.mode == 'visible' and a.bbox is not None]
+        # Draw predicted bboxes (green for tracks)
+        for pred in predictions:
+            x, y, w, h = map(int, pred['bbox'])
+            cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2) # Green box
+            if pred['id'] is not None:
+                cv2.putText(img, str(pred['id']), (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        # Optionally draw ground truth (red for GT)
+        ground_truth = self.ground_truth[self.frame_idx - 1] if self.frame_idx - 1 < len(self.ground_truth) else [] # Adjust index
+        for gt in ground_truth:
+            x, y, w, h = map(int, gt['bbox'])
+            cv2.rectangle(img, (x, y), (x + w, y + h), (0, 0, 255), 2) # Red box
+            cv2.putText(img, f"GT {gt['id']}", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        # Display or save
+        if mode == 'human':
+            cv2.imshow('Tracking Visualization', img)
+            cv2.waitKey(1) # Brief delay for display
+        elif mode == 'rgb_array':
+            return cv2.cvtColor(img, cv2.COLOR_BGR2RGB) # For gym compatibility
+        elif mode == 'save_video' and self.video_writer:
+            self.video_writer.write(img)
+# MAPPO Components
+class Actor(nn.Module):
+    def __init__(self, obs_dim, n_actions, hidden_dims=[128, 64, 32]):
+        super(Actor, self).__init__()
+        dims = [obs_dim] + hidden_dims + [n_actions]
+        self.layers = nn.ModuleList()
+        for i in range(len(dims) - 1):
+            self.layers.append(nn.Linear(dims[i], dims[i+1]))
+    def forward(self, obs):
+        x = obs
+        for i, layer in enumerate(self.layers[:-1]):
+            x = F.relu(layer(x))
+        return self.layers[-1](x) # Logits
+import math
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # x: (batch, seq, embed)
+        seq_len = x.size(1)
+        pe = self.pe[:seq_len].transpose(0, 1)  # (seq, 1, d) -> (1, seq, d) for broadcasting
+        x = x + pe
+        return x
+
+class Critic(nn.Module):
+    def __init__(self, state_dim, obs_dim=18, max_agents=30, embed_dim=128, num_heads=4, num_layers=2):
+        super(Critic, self).__init__()
+        self.obs_dim = obs_dim
+        self.num_agents = max_agents
+        self.embed_dim = embed_dim
+        self.embed = nn.Linear(obs_dim, embed_dim)
+        self.pos_encoder = PositionalEncoding(embed_dim, max_len=max_agents)
+        # batch_first=True for perf; fixes nested tensor warning
+        encoder_layer = TransformerEncoderLayer(
+            d_model=embed_dim, nhead=num_heads, dim_feedforward=512, dropout=0.1, batch_first=True
+        )
+        self.transformer_encoder = TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.fc = nn.Linear(embed_dim, 1)
+
+    def forward(self, state):
+        batch_size = state.size(0)
+        x = state.view(batch_size, self.num_agents, self.obs_dim)
+        # Mask inactive agents based on mode one-hot [13:16] (sum >0 if active)
+        mode_mask = (x[:, :, 13:16].sum(dim=-1, keepdim=True) > 0).float()  # (batch, agents, 1)
+        x = x * mode_mask  # Zero obs for inactive agents
+        x = self.embed(x)  # (batch, agents, embed_dim)
+        x = self.pos_encoder(x)  # (batch, agents, embed)
+        x = self.transformer_encoder(x)  # (batch, agents, embed)
+        # Re-apply mask post-transformer
+        x = x * mode_mask.expand(-1, -1, self.embed_dim)
+        # Aggregated: sum over agents / active count (FIX: keepdim=False to avoid [batch,1,1])
+        active_count = mode_mask.sum(dim=1, keepdim=False) + 1e-8  # (batch, 1) → broadcasts correctly
+        x = x.sum(dim=1) / active_count  # (batch, embed_dim)
+        return self.fc(x).squeeze(-1)  # (batch,)
+def compute_gae(rewards, values, next_values, dones, gamma, lambda_):
+    advantages = []
+    gae = 0
+    for i in reversed(range(len(rewards))):
+        delta = rewards[i] + gamma * next_values[i] * (1 - dones[i]) - values[i]
+        gae = delta + gamma * lambda_ * (1 - dones[i]) * gae
+        advantages.insert(0, gae)
+    return advantages
+def combine_plot(rewards, motas):
+    if not rewards or not motas:
+        return
+    episodes = range(1, len(rewards) + 1)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    ax1.set_ylabel('Episode Reward')
+    ax1.plot(episodes, rewards, color='tab:blue', marker='o', label='Reward')
+    ax1.set_title('Episode Reward')
+    ax2.set_xlabel('Episodes')
+    ax2.set_ylabel('MOTA')
+    ax2.plot(episodes, motas, color='tab:red', marker='x', label='MOTA')
+    ax2.set_title('MOTA')
+    fig.suptitle('MAPPO Training Metrics')
+    fig.tight_layout()
+    plt.savefig('mappo_combined_training_plot.png')
+    plt.close(fig) # No show, no block
+def create_marlmot_env(data_dir, ground_truth_dir, sequence, max_agents):
+    return MARLMOTEnv(data_dir, ground_truth_dir, sequence, max_agents)
+def train_with_mappo(mot17_dir, ground_truth_dir, sequences, max_agents=30, total_timesteps=1000000):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    valid_sequences = []
+    for seq in sequences:
+        det_path = os.path.join(mot17_dir, seq, 'det', 'det.txt')
+        gt_path = os.path.join(ground_truth_dir, seq, 'gt', 'gt.txt')
+        if os.path.exists(det_path) and os.path.exists(gt_path):
+            valid_sequences.append(seq)
+        else:
+            pass
+   
+    # Changes: Create env_fn partials for each sequence
+    env_fns = [partial(create_marlmot_env, mot17_dir, ground_truth_dir, seq, max_agents) for seq in valid_sequences]
+   
+    if not valid_sequences:
+        raise ValueError("No valid sequences found; check your data directory.")
+   
+    obs_dim = 18
+    n_actions = 5
+    state_dim = max_agents * obs_dim
+    actor = Actor(obs_dim, n_actions).to(device)
+    critic = Critic(state_dim, obs_dim=obs_dim, max_agents=max_agents).to(device)
+    actor_optimizer = optim.Adam(actor.parameters(), lr=3e-4)
+    critic_optimizer = optim.Adam(critic.parameters(), lr=3e-4)
+   
+    # Fix deprecation: torch.amp.GradScaler('cuda')
+    scaler = torch.amp.GradScaler('cuda')
+   
+    # MAPPO hyperparameters (unchanged)
+    clip_param = 0.05
+    vf_clip_param = 10.0
+    entropy_coef = 0.01
+    value_loss_coef = 0.5
+    gae_lambda = 0.95
+    gamma = 0.99
+    num_epochs = 20
+    batch_size = 1024
+    max_grad_norm = 0.5
+    # Value normalization (new)
+    value_mean = 0.0
+    value_var = 1.0
+    value_update_rate = 1e-3
+   
+    rollout = namedtuple('Rollout', ['states', 'obs', 'actions', 'log_probs', 'rewards', 'values', 'dones', 'next_obs', 'next_states'])
+    ep_rewards = []
+    ep_motas = []
+    ep_m_ts = []
+    ep_fp_ts = []
+    ep_mme_ts = []
+    best_mota = -np.inf
+    step_count = 0
+    pbar = tqdm(total=total_timesteps, desc="MAPPO Training")
+   
+    while step_count < total_timesteps:
+        global_episode_reward = 0
+        total_m_t = 0 # Thêm: tích lũy tổng m_t qua sequences
+        total_fp_t = 0 # Tương tự
+        total_mme_t = 0 # Tương tự
+        total_g_t = 0 # Để tính global MOTA nếu cần
+        num_seqs = len(valid_sequences) # For averaging
+        all_states = [] # Accumulate across sequences
+        all_obs_list = []
+        all_actions_list = []
+        all_log_probs_list = []
+        all_rewards = []
+        all_values = []
+        all_dones = []
+        all_advantages = [] # Fix: Accumulate advantages per sequence
+        all_returns = [] # Fix: Accumulate returns per sequence
+        seq_motas = [] # Per-sequence MOTA
+        seq_rewards = [] # Per-sequence reward
+       
+        actor.eval()
+        critic.eval()
+       
+        for env_fn in env_fns: # Loop over each sequence
+            env = env_fn() # Create fresh env for this sequence
+            flat_obs, _ = env.reset()
+            episode_reward = 0
+            done = False
+            states = []
+            obs_list = []
+            actions_list = []
+            log_probs_list = []
+            rewards = []
+            values = []
+            dones = []
+           
+            while not done and step_count < total_timesteps:
+                obs = flat_obs.reshape(max_agents, obs_dim)
+                state = torch.FloatTensor(flat_obs).to(device, non_blocking=True).unsqueeze(0)
+                # Fix deprecation: torch.amp.autocast(device_type='cuda')
+                with torch.no_grad(), torch.amp.autocast(device_type='cuda'):
+                    value = critic(state).item()
+                obs_t = torch.FloatTensor(obs).to(device, non_blocking=True)
+                with torch.no_grad(), torch.amp.autocast(device_type='cuda'):
+                    logits = actor(obs_t)
+                dist = Categorical(logits=logits)
+                actions_t = dist.sample()
+                log_probs_t = dist.log_prob(actions_t)
+                agent_actions = actions_t.cpu().numpy()
+                agent_log_probs = log_probs_t.cpu().numpy()
+                next_flat_obs, reward, done, _, info = env.step(agent_actions)
+                # TODO: Disable env.render for speed if not debugging
+                # env.render(mode='save_video')
+                states.append(flat_obs.copy())
+                obs_list.append(obs.copy())
+                actions_list.append(agent_actions.copy())
+                log_probs_list.append(agent_log_probs.copy())
+                rewards.append(reward)
+                values.append(value)
+                dones.append(0.0 if not done else 1.0)
+                episode_reward += reward
+                flat_obs = next_flat_obs
+                step_count += 1
+                pbar.update(1)
+           
+            # Last value for GAE (per sequence) - Fix: Use 0 if done
+            next_state = torch.FloatTensor(flat_obs).to(device, non_blocking=True).unsqueeze(0)
+            with torch.no_grad(), torch.amp.autocast(device_type='cuda'):
+                next_value = critic(next_state).item() if not done else 0.0
+           
+            # Compute GAE for THIS sequence only - Fix chính cho vấn đề 1
+            advantages = compute_gae(rewards, values, [next_value] * len(rewards), dones, gamma, gae_lambda)
+            returns = [adv + val for adv, val in zip(advantages, values)]
+           
+            # Accumulate processed advantages and returns
+            all_advantages.extend(advantages)
+            all_returns.extend(returns)
+           
+            # Accumulate raw data for tensors
+            all_states.extend(states)
+            all_obs_list.extend(obs_list)
+            all_actions_list.extend(actions_list)
+            all_log_probs_list.extend(log_probs_list)
+            all_rewards.extend(rewards)
+            all_values.extend(values)
+            all_dones.extend(dones)
+           
+            # Per-sequence metrics
+            seq_mota = info['mota']
+            seq_rewards.append(episode_reward)
+            seq_motas.append(seq_mota)
+           
+            # Accumulate global
+            global_episode_reward += episode_reward
+            total_m_t += env.episode_mota_components['m_t']
+            total_fp_t += env.episode_mota_components['fp_t']
+            total_mme_t += env.episode_mota_components['mme_t']
+            total_g_t += env.episode_mota_components['g_t']  # Thêm để tính global MOTA
+           
+            env.close()  # Clean up env
+       
+        # Average MOTA and reward across sequences
+        avg_mota = (1 - (total_m_t + total_fp_t + total_mme_t) / total_g_t) if total_g_t > 0 else 0  # Global MOTA
+        avg_episode_reward = global_episode_reward / num_seqs if num_seqs > 0 else 0
+
+        # Value Normalization (new: applied after accumulation)
+        all_returns_np = np.array(all_returns)
+        all_values_np = np.array(all_values)
+        current_returns_mean = all_returns_np.mean()
+        current_returns_var = all_returns_np.var() + 1e-8
+        current_values_mean = all_values_np.mean()  # Use returns mean for values too (standard)
+        current_values_var = all_values_np.var() + 1e-8
+
+        # EMA update for mean and var
+        value_mean = value_mean * (1 - value_update_rate) + current_returns_mean * value_update_rate
+        value_var = value_var * (1 - value_update_rate) + current_returns_var * value_update_rate
+        value_std = np.sqrt(max(value_var, 1e-8))
+
+        # Normalize returns and old values
+        normalized_returns = (all_returns_np - value_mean) / value_std
+        normalized_old_values = (all_values_np - value_mean) / value_std
+       
+        # Tensors from accumulated data
+        states_t = torch.FloatTensor(np.stack(all_states)).to(device, non_blocking=True)
+        obs_t = torch.FloatTensor(np.stack(all_obs_list)).to(device, non_blocking=True)
+        actions_t = torch.LongTensor(np.stack(all_actions_list)).to(device, non_blocking=True)
+        old_log_probs_t = torch.FloatTensor(np.stack(all_log_probs_list)).to(device, non_blocking=True)
+        returns_t = torch.FloatTensor(normalized_returns).to(device, non_blocking=True)  # Normalized
+        advantages_t = torch.FloatTensor(all_advantages).to(device, non_blocking=True)  # Raw advantages (already normalized separately)
+        values_t = torch.FloatTensor(normalized_old_values).to(device, non_blocking=True)  # Normalized old values
+       
+        advantages_t = (advantages_t - advantages_t.mean()) / (advantages_t.std() + 1e-8)
+       
+        actor.train()
+        critic.train()
+        num_steps = len(all_rewards)
+        for epoch in range(num_epochs):
+            for start in range(0, num_steps, batch_size):
+                end = start + batch_size
+                batch_states = states_t[start:end]
+                batch_obs = obs_t[start:end]
+                batch_actions = actions_t[start:end]
+                batch_old_log_probs = old_log_probs_t[start:end]
+                batch_returns = returns_t[start:end]  # Normalized
+                batch_advantages = advantages_t[start:end]
+                batch_values = values_t[start:end]  # Normalized old values
+               
+                # Critic update (updated for normalization)
+                with torch.amp.autocast(device_type='cuda'):
+                    new_values = critic(batch_states)  # Outputs normalized values [batch]
+                    vf_loss1 = F.mse_loss(new_values, batch_returns)
+                    clipped_values = batch_values + torch.clamp(new_values - batch_values, -vf_clip_param, vf_clip_param)
+                    vf_loss2 = F.mse_loss(clipped_values, batch_returns)
+                    value_loss = 0.5 * torch.max(vf_loss1, vf_loss2).mean()
+                critic_optimizer.zero_grad()
+                scaler.scale(value_loss).backward()
+                scaler.unscale_(critic_optimizer)
+                torch.nn.utils.clip_grad_norm_(critic.parameters(), max_grad_norm)
+                scaler.step(critic_optimizer)
+               
+                # Actor update (unchanged)
+                with torch.amp.autocast(device_type='cuda'):
+                    policy_loss = 0
+                    entropy_loss = 0
+                    agent_obs = batch_obs.view(-1, obs_dim)
+                    logits = actor(agent_obs).view(batch_obs.shape[0], max_agents, n_actions)
+                    log_probs = F.log_softmax(logits, dim=-1)
+                    probs = F.softmax(logits, dim=-1)
+                    actions_exp = batch_actions.unsqueeze(-1)
+                    new_log_probs = torch.gather(log_probs, dim=-1, index=actions_exp).squeeze(-1)
+                    entropy = - (probs * log_probs).sum(dim=-1)
+                    entropy_loss = entropy.mean()
+                    ratios = torch.exp(new_log_probs - batch_old_log_probs)
+                    surr1 = ratios * batch_advantages.unsqueeze(1)
+                    surr2 = torch.clamp(ratios, 1 - clip_param, 1 + clip_param) * batch_advantages.unsqueeze(1)
+                    policy_loss = -torch.min(surr1, surr2).mean()
+                    actor_loss = policy_loss - entropy_coef * entropy_loss
+                actor_optimizer.zero_grad()
+                scaler.scale(actor_loss).backward()
+                scaler.unscale_(actor_optimizer)
+                torch.nn.utils.clip_grad_norm_(actor.parameters(), max_grad_norm)
+                scaler.step(actor_optimizer)
+                scaler.update()
+       
+        # Log global episode (use averages)
+        print(f"Avg MOTA: {avg_mota:.4f}, Value Mean/Std: {value_mean:.4f}/{value_std:.4f}")
+        ep_rewards.append(avg_episode_reward)
+        ep_motas.append(avg_mota)
+        ep_m_ts.append(total_m_t)  # Append tổng
+        ep_fp_ts.append(total_fp_t)
+        ep_mme_ts.append(total_mme_t)
+       
+        if len(ep_rewards) % 10 == 0:  # Plot every 10 episodes for less I/O
+            enhanced_combine_plot(ep_rewards, ep_motas, ep_m_ts, ep_fp_ts, ep_mme_ts)
+       
+        if avg_mota > best_mota:
+            best_mota = avg_mota
+            torch.save(actor.state_dict(), 'best_mappo_actor.pth')
+            torch.save(critic.state_dict(), 'best_mappo_critic.pth')
+   
+    # Cleanup and save (unchanged)
+    torch.save(actor.state_dict(), 'mappo_actor.pth')
+    torch.save(critic.state_dict(), 'mappo_critic.pth')
+    combine_plot(ep_rewards, ep_motas)
+    return actor, critic
+def enhanced_combine_plot(rewards, motas, m_ts, fp_ts, mme_ts):
+    if not rewards or not motas:
+        return
+    episodes = range(1, len(rewards) + 1)
+    fig, axs = plt.subplots(5, 1, figsize=(10, 20), sharex=True)
+    axs[0].set_ylabel('Episode Reward')
+    axs[0].plot(episodes, rewards, color='tab:blue', marker='o', label='Reward')
+    axs[0].set_title('Episode Reward')
+    axs[1].set_ylabel('MOTA')
+    axs[1].plot(episodes, motas, color='tab:red', marker='x', label='MOTA')
+    axs[1].set_title('MOTA')
+    axs[2].set_ylabel('Misses (m_t)')
+    axs[2].plot(episodes, m_ts, color='tab:green', marker='s', label='Misses')
+    axs[2].set_title('Misses (m_t)')
+    axs[3].set_ylabel('False Positives (fp_t)')
+    axs[3].plot(episodes, fp_ts, color='tab:orange', marker='d', label='FP')
+    axs[3].set_title('False Positives (fp_t)')
+    axs[4].set_ylabel('ID Switches (mme_t)')
+    axs[4].plot(episodes, mme_ts, color='tab:purple', marker='^', label='ID Switches')
+    axs[4].set_title('ID Switches (mme_t)')
+    axs[4].set_xlabel('Episodes')
+    fig.suptitle('MAPPO Training Metrics Including MOTA Components')
+    fig.tight_layout()
+    plt.savefig('enhanced_mappo_training_plot.png')
+    plt.close(fig) # Closes the figure to free memory
+def main():
+    mot17_dir = r"C:\Users\User\Desktop\code_python\paper2_multi_tracking\train\MOT15\MOT15\train"
+    ground_truth_dir = mot17_dir
+    sequences = ['MOT17-05-SDP']
+    sequences = [
+    'ADL-Rundle-6', 'ADL-Rundle-8', 'ETH-Bahnhof', 'ETH-Jelmoli', 'ETH-Sunnyday',
+    'KITTI-13', 'KITTI-17', 'PETS09-S2L1', 'TUD-Campus', 'TUD-Stadtmitte', 'Venice-2'
+]
+    actor, critic = train_with_mappo(mot17_dir, ground_truth_dir, sequences, max_agents=30, total_timesteps=1000000000000000000000000000000)
+if __name__ == "__main__":
+    main()
